@@ -159,9 +159,9 @@ fn create_optional_fields(fields: &Vec<Field>) -> Vec<proc_macro2::TokenStream> 
                 None
             } else {
                 Some(if type_name_string.starts_with("Option<") {
-                    quote! { #(#attrs)* pub #field_name: Option<rustot::shadows::Patch<<#type_name as rustot::shadows::ShadowPatch>::PatchState>> }
+                    quote! { #(#attrs)* #[serde(skip_serializing_if = "Option::is_none")] pub #field_name: Option<rustot::shadows::Patch<<#type_name as rustot::shadows::ShadowPatch>::PatchState>> }
                 } else {
-                    quote! { #(#attrs)* pub #field_name: Option<<#type_name as rustot::shadows::ShadowPatch>::PatchState> }
+                    quote! { #(#attrs)* #[serde(skip_serializing_if = "Option::is_none")] pub #field_name: Option<<#type_name as rustot::shadows::ShadowPatch>::PatchState> }
                 })
             }
         })

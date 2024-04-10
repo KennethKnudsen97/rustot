@@ -34,9 +34,9 @@ impl<T> From<T> for Patch<T> {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct State<T> {
-    #[serde(rename = "desired")]
+    #[serde(rename = "desired", skip_serializing_if = "Option::is_none")]
     pub desired: Option<T>,
-    #[serde(rename = "reported")]
+    #[serde(rename = "reported", skip_serializing_if = "Option::is_none")]
     pub reported: Option<T>,
 }
 

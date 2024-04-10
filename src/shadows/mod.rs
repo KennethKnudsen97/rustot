@@ -86,41 +86,35 @@ where
         &mut self,
         state: &mut S,
         delta: Option<S::PatchState>,
-        update_desired: Option<bool>,
     ) -> Result<(), Error> {
         if let Some(ref delta) = delta {
             state.apply_patch(delta.clone());
         }
 
         debug!(
-            "[{:?}] Updating reported shadow value. Update_desired: {:?}",
-            S::NAME.unwrap_or_else(|| CLASSIC_SHADOW),
-            update_desired
+            "[{:?}] Updating reported shadow value.",
+            S::NAME.unwrap_or(CLASSIC_SHADOW),
         );
 
-        if let Some(update_desired) = update_desired {
-            let desired = if update_desired { Some(&state) } else { None };
+        //IoT device should only edit reported.
+        let request = data_types::Request {
+            state: data_types::State {
+                reported: delta,
+                desired: None,
+            },
+            client_token: None,
+            version: None,
+        };
 
-            let request = data_types::Request {
-                state: data_types::State {
-                    reported: Some(&state),
-                    desired,
-                },
-                client_token: None,
-                version: None,
-            };
+        let payload = serde_json_core::to_vec::<
+            _,
+            { S::MAX_PAYLOAD_SIZE + PARTIAL_REQUEST_OVERHEAD },
+        >(&request)
+        .map_err(|_| Error::Overflow)?;
 
-            let payload = serde_json_core::to_vec::<
-                _,
-                { S::MAX_PAYLOAD_SIZE + PARTIAL_REQUEST_OVERHEAD },
-            >(&request)
-            .map_err(|_| Error::Overflow)?;
-
-            let update_topic =
-                Topic::Update.format::<MAX_TOPIC_LEN>(self.mqtt.client_id(), S::NAME)?;
-            self.mqtt
-                .publish(update_topic.as_str(), &payload, QoS::AtLeastOnce)?;
-        }
+        let update_topic = Topic::Update.format::<MAX_TOPIC_LEN>(self.mqtt.client_id(), S::NAME)?;
+        self.mqtt
+            .publish(update_topic.as_str(), &payload, QoS::AtLeastOnce)?;
 
         Ok(())
     }
@@ -130,6 +124,35 @@ where
         let get_topic = Topic::Get.format::<MAX_TOPIC_LEN>(self.mqtt.client_id(), S::NAME)?;
         self.mqtt
             .publish(get_topic.as_str(), b"", QoS::AtLeastOnce)?;
+        Ok(())
+    }
+
+    //This is only for reporting the state
+    pub fn report_shadow(&mut self, state: &S) -> Result<(), Error> {
+        debug!(
+            "[{:?}] reporting shadow value.",
+            S::NAME.unwrap_or(CLASSIC_SHADOW),
+        );
+
+        let request = data_types::Request {
+            state: data_types::State {
+                reported: Some(state),
+                desired: None,
+            },
+            client_token: None,
+            version: None,
+        };
+
+        let payload = serde_json_core::to_vec::<
+            _,
+            { S::MAX_PAYLOAD_SIZE + PARTIAL_REQUEST_OVERHEAD },
+        >(&request)
+        .map_err(|_| Error::Overflow)?;
+
+        let update_topic = Topic::Update.format::<MAX_TOPIC_LEN>(self.mqtt.client_id(), S::NAME)?;
+        self.mqtt
+            .publish(update_topic.as_str(), &payload, QoS::AtLeastOnce)?;
+
         Ok(())
     }
 
@@ -199,7 +222,6 @@ where
     ///
     /// This function needs to be fed all relevant incoming MQTT payloads in
     /// order for the shadow manager to work.
-    #[must_use]
     pub fn handle_message(
         &mut self,
         topic: &str,
@@ -224,22 +246,16 @@ where
                 serde_json_core::from_slice::<AcceptedResponse<S::PatchState>>(payload)
                     .map_err(|_| Error::InvalidPayload)
                     .and_then(|(response, _)| {
-                        if let Some(_) = response.state.delta {
+                        if response.state.delta.is_some() {
                             debug!(
                                 "[{:?}] Received delta state",
-                                S::NAME.unwrap_or_else(|| CLASSIC_SHADOW)
+                                S::NAME.unwrap_or(CLASSIC_SHADOW)
                             );
-                            self.handler.change_shadow_value(
-                                &mut state,
-                                response.state.delta.clone(),
-                                Some(false),
-                            )?;
-                        } else if let Some(_) = response.state.reported {
-                            self.handler.change_shadow_value(
-                                &mut state,
-                                response.state.reported,
-                                None,
-                            )?;
+                            self.handler
+                                .change_shadow_value(&mut state, response.state.delta.clone())?;
+                        } else if response.state.reported.is_some() {
+                            self.handler
+                                .change_shadow_value(&mut state, response.state.reported)?;
                         }
                         Ok(response.state.delta)
                     })?
@@ -250,7 +266,7 @@ where
                     if error.code == 404 && matches!(topic, Topic::GetRejected) {
                         debug!(
                             "[{:?}] Thing has no shadow document. Creating with defaults...",
-                            S::NAME.unwrap_or_else(|| CLASSIC_SHADOW)
+                            S::NAME.unwrap_or(CLASSIC_SHADOW)
                         );
                         self.report_shadow()?;
                     } else {
@@ -273,23 +289,20 @@ where
                 // message body.
                 debug!(
                     "[{:?}] Received shadow delta event.",
-                    S::NAME.unwrap_or_else(|| CLASSIC_SHADOW),
+                    S::NAME.unwrap_or(CLASSIC_SHADOW),
                 );
 
                 serde_json_core::from_slice::<DeltaResponse<S::PatchState>>(payload)
                     .map_err(|_| Error::InvalidPayload)
                     .and_then(|(delta, _)| {
-                        if let Some(_) = delta.state {
+                        if delta.state.is_some() {
                             debug!(
                                 "[{:?}] Delta reports new desired value. Changing local value...",
-                                S::NAME.unwrap_or_else(|| CLASSIC_SHADOW),
+                                S::NAME.unwrap_or(CLASSIC_SHADOW),
                             );
                         }
-                        self.handler.change_shadow_value(
-                            &mut state,
-                            delta.state.clone(),
-                            Some(false),
-                        )?;
+                        self.handler
+                            .change_shadow_value(&mut state, delta.state.clone())?;
                         Ok(delta.state)
                     })?
             }
@@ -299,7 +312,7 @@ where
 
                 debug!(
                     "[{:?}] Finished updating reported shadow value.",
-                    S::NAME.unwrap_or_else(|| CLASSIC_SHADOW)
+                    S::NAME.unwrap_or(CLASSIC_SHADOW)
                 );
 
                 None
@@ -328,9 +341,8 @@ where
 
     /// Initiate an `UpdateShadow` request, reporting the local state to the cloud.
     pub fn report_shadow(&mut self) -> Result<(), Error> {
-        let mut state = self.dao.read()?;
-        self.handler
-            .change_shadow_value(&mut state, None, Some(false))?;
+        let state = self.dao.read()?;
+        self.handler.report_shadow(&state)?;
         Ok(())
     }
 
@@ -351,7 +363,7 @@ where
         let should_persist = f(&state, &mut desired);
 
         self.handler
-            .change_shadow_value(&mut state, Some(desired), Some(false))?;
+            .change_shadow_value(&mut state, Some(desired))?;
 
         if should_persist {
             self.dao.write(&state)?;
@@ -406,7 +418,6 @@ where
     ///
     /// This function needs to be fed all relevant incoming MQTT payloads in
     /// order for the shadow manager to work.
-    #[must_use]
     pub fn handle_message(
         &mut self,
         topic: &str,
@@ -429,22 +440,18 @@ where
                 serde_json_core::from_slice::<AcceptedResponse<S::PatchState>>(payload)
                     .map_err(|_| Error::InvalidPayload)
                     .and_then(|(response, _)| {
-                        if let Some(_) = response.state.delta {
+                        if response.state.delta.is_some() {
                             debug!(
                                 "[{:?}] Received delta state",
-                                S::NAME.unwrap_or_else(|| CLASSIC_SHADOW)
+                                S::NAME.unwrap_or(CLASSIC_SHADOW)
                             );
                             self.handler.change_shadow_value(
                                 &mut self.state,
                                 response.state.delta.clone(),
-                                Some(false),
                             )?;
-                        } else if let Some(_) = response.state.reported {
-                            self.handler.change_shadow_value(
-                                &mut self.state,
-                                response.state.reported,
-                                None,
-                            )?;
+                        } else if response.state.reported.is_some() {
+                            self.handler
+                                .change_shadow_value(&mut self.state, response.state.reported)?;
                         }
                         Ok(response.state.delta)
                     })?
@@ -455,7 +462,7 @@ where
                     if error.code == 404 && matches!(topic, Topic::GetRejected) {
                         debug!(
                             "[{:?}] Thing has no shadow document. Creating with defaults...",
-                            S::NAME.unwrap_or_else(|| CLASSIC_SHADOW)
+                            S::NAME.unwrap_or(CLASSIC_SHADOW)
                         );
                         self.report_shadow()?;
                     } else {
@@ -478,23 +485,20 @@ where
                 // message body.
                 debug!(
                     "[{:?}] Received shadow delta event.",
-                    S::NAME.unwrap_or_else(|| CLASSIC_SHADOW),
+                    S::NAME.unwrap_or(CLASSIC_SHADOW),
                 );
 
                 serde_json_core::from_slice::<DeltaResponse<S::PatchState>>(payload)
                     .map_err(|_| Error::InvalidPayload)
                     .and_then(|(delta, _)| {
-                        if let Some(_) = delta.state {
+                        if delta.state.is_some() {
                             debug!(
                                 "[{:?}] Delta reports new desired value. Changing local value...",
-                                S::NAME.unwrap_or_else(|| CLASSIC_SHADOW),
+                                S::NAME.unwrap_or(CLASSIC_SHADOW),
                             );
                         }
-                        self.handler.change_shadow_value(
-                            &mut self.state,
-                            delta.state.clone(),
-                            Some(false),
-                        )?;
+                        self.handler
+                            .change_shadow_value(&mut self.state, delta.state.clone())?;
                         Ok(delta.state)
                     })?
             }
@@ -504,7 +508,7 @@ where
 
                 debug!(
                     "[{:?}] Finished updating reported shadow value.",
-                    S::NAME.unwrap_or_else(|| CLASSIC_SHADOW)
+                    S::NAME.unwrap_or(CLASSIC_SHADOW)
                 );
 
                 None
@@ -522,8 +526,7 @@ where
 
     /// Initiate an `UpdateShadow` request, reporting the local state to the cloud.
     pub fn report_shadow(&mut self) -> Result<(), Error> {
-        self.handler
-            .change_shadow_value(&mut self.state, None, Some(false))?;
+        self.handler.change_shadow_value(&mut self.state, None)?;
         Ok(())
     }
 
@@ -537,7 +540,7 @@ where
         f(&self.state, &mut desired);
 
         self.handler
-            .change_shadow_value(&mut self.state, Some(desired), Some(false))?;
+            .change_shadow_value(&mut self.state, Some(desired))?;
 
         Ok(())
     }
@@ -562,7 +565,7 @@ where
         write!(
             f,
             "[{:?}] = {:?}",
-            S::NAME.unwrap_or_else(|| CLASSIC_SHADOW),
+            S::NAME.unwrap_or(CLASSIC_SHADOW),
             self.get()
         )
     }
@@ -579,7 +582,7 @@ where
         defmt::write!(
             fmt,
             "[{:?}] = {:?}",
-            S::NAME.unwrap_or_else(|| CLASSIC_SHADOW),
+            S::NAME.unwrap_or(CLASSIC_SHADOW),
             self.get()
         )
     }
