@@ -10,7 +10,7 @@ use mqttrust::{Mqtt, QoS};
 
 pub use data_types::Patch;
 pub use error::Error;
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Deserialize};
 pub use shadow_derive as derive;
 pub use shadow_diff::ShadowPatch;
 
@@ -29,15 +29,28 @@ pub trait ShadowState: ShadowPatch {
     const MAX_PAYLOAD_SIZE: usize = 512;
 }
 
-struct ShadowHandler<'a, M: Mqtt, S: ShadowState>
+pub trait ShadowDeserializer {
+    fn from_slice<'a, T: Deserialize<'a>, S>(payload: &'a [u8], state: &S) -> Result<T, Error> {
+        let (t, _) =
+            serde_json_core::from_slice::<T>(payload).map_err(|_| Error::InvalidPayload)?;
+        Ok(t)
+    }
+}
+
+pub struct DefaultDeserializer;
+
+impl ShadowDeserializer for DefaultDeserializer {}
+
+struct ShadowHandler<'a, M: Mqtt, S: ShadowState, DE: ShadowDeserializer = DefaultDeserializer>
 where
     [(); S::MAX_PAYLOAD_SIZE + PARTIAL_REQUEST_OVERHEAD]:,
 {
     mqtt: &'a M,
+    _deserializer: PhantomData<DE>,
     _shadow: PhantomData<S>,
 }
 
-impl<'a, M: Mqtt, S: ShadowState> ShadowHandler<'a, M, S>
+impl<'a, M: Mqtt, S: ShadowState, DE: ShadowDeserializer> ShadowHandler<'a, M, S, DE>
 where
     [(); S::MAX_PAYLOAD_SIZE + PARTIAL_REQUEST_OVERHEAD]:,
 {
@@ -164,19 +177,24 @@ where
     }
 }
 
-pub struct PersistedShadow<'a, S: ShadowState + DeserializeOwned, M: Mqtt, D: ShadowDAO<S>>
-where
-    [(); S::MAX_PAYLOAD_SIZE + PARTIAL_REQUEST_OVERHEAD]:,
-{
-    handler: ShadowHandler<'a, M, S>,
-    pub(crate) dao: D,
-}
-
-impl<'a, S, M, D> PersistedShadow<'a, S, M, D>
+pub struct PersistedShadow<'a, S, M, D, DE = DefaultDeserializer>
 where
     S: ShadowState + DeserializeOwned,
     M: Mqtt,
     D: ShadowDAO<S>,
+    DE: ShadowDeserializer,
+    [(); S::MAX_PAYLOAD_SIZE + PARTIAL_REQUEST_OVERHEAD]:,
+{
+    handler: ShadowHandler<'a, M, S, DE>,
+    pub(crate) dao: D,
+}
+
+impl<'a, S, M, D, DE> PersistedShadow<'a, S, M, D, DE>
+where
+    S: ShadowState + DeserializeOwned,
+    M: Mqtt,
+    D: ShadowDAO<S>,
+    DE: ShadowDeserializer,
     [(); S::MAX_PAYLOAD_SIZE + PARTIAL_REQUEST_OVERHEAD]:,
 {
     /// Instantiate a new shadow that will be automatically persisted to NVM
@@ -194,7 +212,9 @@ where
         let handler = ShadowHandler {
             mqtt,
             _shadow: PhantomData,
+            _deserializer: PhantomData,
         };
+
         if auto_subscribe {
             handler.subscribe()?;
         }
@@ -243,9 +263,8 @@ where
             Topic::GetAccepted => {
                 // The actions necessary to process the state document in the
                 // message body.
-                serde_json_core::from_slice::<AcceptedResponse<S::PatchState>>(payload)
-                    .map_err(|_| Error::InvalidPayload)
-                    .and_then(|(response, _)| {
+                DE::from_slice::<AcceptedResponse<S::PatchState>, S>(payload, &state).and_then(
+                    |response| {
                         if response.state.delta.is_some() {
                             debug!(
                                 "[{:?}] Received delta state",
@@ -258,11 +277,12 @@ where
                                 .change_shadow_value(&mut state, response.state.reported)?;
                         }
                         Ok(response.state.delta)
-                    })?
+                    },
+                )?
             }
             Topic::GetRejected | Topic::UpdateRejected => {
                 // Respond to the error message in the message body.
-                if let Ok((error, _)) = serde_json_core::from_slice::<ErrorResponse>(payload) {
+                if let Ok(error) = DE::from_slice::<ErrorResponse, S>(payload, &state) {
                     if error.code == 404 && matches!(topic, Topic::GetRejected) {
                         debug!(
                             "[{:?}] Thing has no shadow document. Creating with defaults...",
@@ -292,9 +312,9 @@ where
                     S::NAME.unwrap_or(CLASSIC_SHADOW),
                 );
 
-                serde_json_core::from_slice::<DeltaResponse<S::PatchState>>(payload)
+                DE::from_slice::<DeltaResponse<S::PatchState>, S>(payload, &state)
                     .map_err(|_| Error::InvalidPayload)
-                    .and_then(|(delta, _)| {
+                    .and_then(|delta| {
                         if delta.state.is_some() {
                             debug!(
                                 "[{:?}] Delta reports new desired value. Changing local value...",
@@ -377,18 +397,22 @@ where
     }
 }
 
-pub struct Shadow<'a, S: ShadowState, M: Mqtt>
-where
-    [(); S::MAX_PAYLOAD_SIZE + PARTIAL_REQUEST_OVERHEAD]:,
-{
-    state: S,
-    handler: ShadowHandler<'a, M, S>,
-}
-
-impl<'a, S, M> Shadow<'a, S, M>
+pub struct Shadow<'a, S, M, DE = DefaultDeserializer>
 where
     S: ShadowState,
     M: Mqtt,
+    DE: ShadowDeserializer,
+    [(); S::MAX_PAYLOAD_SIZE + PARTIAL_REQUEST_OVERHEAD]:,
+{
+    state: S,
+    handler: ShadowHandler<'a, M, S, DE>,
+}
+
+impl<'a, S, M, DE> Shadow<'a, S, M, DE>
+where
+    S: ShadowState,
+    M: Mqtt,
+    DE: ShadowDeserializer,
     [(); S::MAX_PAYLOAD_SIZE + PARTIAL_REQUEST_OVERHEAD]:,
 {
     /// Instantiate a new non-persisted shadow
@@ -396,6 +420,7 @@ where
         let handler = ShadowHandler {
             mqtt,
             _shadow: PhantomData,
+            _deserializer: PhantomData,
         };
         if auto_subscribe {
             handler.subscribe()?;
@@ -437,9 +462,8 @@ where
             Topic::GetAccepted => {
                 // The actions necessary to process the state document in the
                 // message body.
-                serde_json_core::from_slice::<AcceptedResponse<S::PatchState>>(payload)
-                    .map_err(|_| Error::InvalidPayload)
-                    .and_then(|(response, _)| {
+                DE::from_slice::<AcceptedResponse<S::PatchState>, S>(payload, &self.state)
+                    .and_then(|response| {
                         if response.state.delta.is_some() {
                             debug!(
                                 "[{:?}] Received delta state",
@@ -458,7 +482,7 @@ where
             }
             Topic::GetRejected | Topic::UpdateRejected => {
                 // Respond to the error message in the message body.
-                if let Ok((error, _)) = serde_json_core::from_slice::<ErrorResponse>(payload) {
+                if let Ok(error) = DE::from_slice::<ErrorResponse, S>(payload, &self.state) {
                     if error.code == 404 && matches!(topic, Topic::GetRejected) {
                         debug!(
                             "[{:?}] Thing has no shadow document. Creating with defaults...",
@@ -488,9 +512,8 @@ where
                     S::NAME.unwrap_or(CLASSIC_SHADOW),
                 );
 
-                serde_json_core::from_slice::<DeltaResponse<S::PatchState>>(payload)
-                    .map_err(|_| Error::InvalidPayload)
-                    .and_then(|(delta, _)| {
+                DE::from_slice::<DeltaResponse<S::PatchState>, S>(payload, &self.state).and_then(
+                    |delta| {
                         if delta.state.is_some() {
                             debug!(
                                 "[{:?}] Delta reports new desired value. Changing local value...",
@@ -500,7 +523,8 @@ where
                         self.handler
                             .change_shadow_value(&mut self.state, delta.state.clone())?;
                         Ok(delta.state)
-                    })?
+                    },
+                )?
             }
             Topic::UpdateAccepted => {
                 // Confirm the updated data in the message body matches the
@@ -555,10 +579,11 @@ where
     }
 }
 
-impl<'a, S, M> core::fmt::Debug for Shadow<'a, S, M>
+impl<'a, S, M, DE> core::fmt::Debug for Shadow<'a, S, M, DE>
 where
     S: ShadowState + core::fmt::Debug,
     M: Mqtt,
+    DE: ShadowDeserializer,
     [(); S::MAX_PAYLOAD_SIZE + PARTIAL_REQUEST_OVERHEAD]:,
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -572,10 +597,11 @@ where
 }
 
 #[cfg(feature = "defmt")]
-impl<'a, S, M> defmt::Format for Shadow<'a, S, M>
+impl<'a, S, M, DE> defmt::Format for Shadow<'a, S, M, DE>
 where
     S: ShadowState + defmt::Format,
     M: Mqtt,
+    DE: ShadowDeserializer,
     [(); S::MAX_PAYLOAD_SIZE + PARTIAL_REQUEST_OVERHEAD]:,
 {
     fn format(&self, fmt: defmt::Formatter) {
@@ -588,10 +614,11 @@ where
     }
 }
 
-impl<'a, S, M> Drop for Shadow<'a, S, M>
+impl<'a, S, M, DE> Drop for Shadow<'a, S, M, DE>
 where
     S: ShadowState,
     M: Mqtt,
+    DE: ShadowDeserializer,
     [(); S::MAX_PAYLOAD_SIZE + PARTIAL_REQUEST_OVERHEAD]:,
 {
     fn drop(&mut self) {
